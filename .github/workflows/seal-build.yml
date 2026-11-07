@@ -1,0 +1,127 @@
+name: seal-build
+
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on Go's own
+# LUCI builders with `go test ./...` against the two supported Go releases).
+# This workflow mirrors that: build + full test suite on Go 1.24 (the go.mod
+# directive) and Go 1.25 (current at the v0.45.0 release, 2025-10-07), and packs
+# the module zip exactly as proxy.golang.org serves it.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: go ${{ matrix.go }} / ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24.x", "1.25.x"]
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Go version
+        run: go version && go env GOVERSION GOOS GOARCH
+
+      - name: Pack module zip (v0.45.0)
+        if: matrix.go == '1.25.x'
+        run: |
+          set -euo pipefail
+          # Copy the module tree without VCS metadata and without this
+          # Seal-authored workflow (upstream ships no .github directory), then
+          # pack it with Go's own module-zip implementation.
+          MODSRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$MODSRC"
+          tar -C "$GITHUB_WORKSPACE" --exclude=./.git --exclude=./.github -cf - . | tar -C "$MODSRC" -xf -
+          HELPER="$RUNNER_TEMP/zipper"
+          mkdir -p "$HELPER"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          OUT="$RUNNER_TEMP/build_output"
+          mkdir -p "$OUT"
+          cd "$HELPER"
+          GOFLAGS=-mod=mod go mod init example.com/zipper
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.28.0
+          GOFLAGS=-mod=mod go run . golang.org/x/net v0.45.0 "$MODSRC" "$OUT/v0.45.0.zip"
+          unzip -l "$OUT/v0.45.0.zip" | tail -n 3
+          echo "ZIP_OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Enable loopback IPv6 and unprivileged ICMP for the ipv4/ipv6/icmp tests
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip -6 addr show dev lo
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            # http2's external-network test is opt-in (-extnet); run it too.
+            # transport_test.go is tagged `go1.25 || goexperiment.synctest`, so
+            # the flag only exists on the Go 1.25 leg.
+            if [ "${{ matrix.go }}" = "1.25.x" ]; then
+              go test -v -run '^TestTransportExternal$' ./http2 -args -extnet 2>&1 | tee -a "$RUNNER_TEMP/full.log"
+            fi
+            # go test -v prints a test's t.Skip message on the lines BEFORE its
+            # "--- SKIP" line, so collect them since the last "=== RUN".
+            echo "Skipped tests (with reasons):"
+            awk '/^=== RUN/{buf=""} /^[[:space:]]+[^[:space:]]+\.go:[0-9]+:/{m=$0; sub(/^[[:space:]]+/, "", m); buf=buf " " m} /^[[:space:]]*--- SKIP/{line=$0; sub(/^[[:space:]]+/, "", line); print "  " line " -- reason:" buf}' "$RUNNER_TEMP/full.log"
+            awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} /^ok[[:space:]]/{k++} END{printf "TEST SUMMARY: %d passed, %d failed, %d skipped (incl. subtests); packages ok: %d\n", p, f, s, k}' "$RUNNER_TEMP/full.log"
+          fi
+
+      - name: Upload module zip
+        if: matrix.go == '1.25.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: ${{ env.ZIP_OUT }}/v0.45.0.zip
+          if-no-files-found: error
